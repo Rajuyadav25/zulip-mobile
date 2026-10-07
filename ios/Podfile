@@ -73,6 +73,16 @@ target 'ZulipMobile' do
         end
       end
     end
+
+    # Xcode 26's clang reports Yoga's `operator"" _pt` spelling as
+    # -Wdeprecated-literal-operator, which Yoga.podspec's -Werror makes fatal.
+    # Keep it a warning (no codegen change).
+    installer.pods_project.targets.each do |target|
+      next unless target.name == 'Yoga'
+      target.build_configurations.each do |config|
+        config.build_settings['OTHER_CFLAGS'] = '$(inherited) -Wno-error=deprecated-literal-operator'
+      end
+    end
   end
 
   use_expo_modules!
