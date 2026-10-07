@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 3 }
+        with: { fetch-depth: 0 }
       - name: Record context
         run: |
           echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"; mkdir -p "$RUNNER_TEMP/evidence"
@@ -59,7 +59,7 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 3 }
+        with: { fetch-depth: 0 }
       - name: Select Xcode 26.6 and record context
         run: |
           echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"; mkdir -p "$RUNNER_TEMP/evidence"
