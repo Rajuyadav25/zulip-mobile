@@ -82,7 +82,7 @@ jobs:
         if: always()
         run: |
           git status --porcelain=v1 --untracked-files=no | tee "$EVIDENCE/tracked-after-install.txt"
-          git diff > "$EVIDENCE/tracked-after-install.diff"
+          git diff --text > "$EVIDENCE/tracked-after-install.diff"; cp ios/Podfile.lock "$EVIDENCE/Podfile.lock.after-install"
       - name: Unsigned iOS Release build (device SDK, signing disabled)
         env: { RCT_NO_LAUNCH_PACKAGER: "1" }
         run: |
@@ -93,10 +93,10 @@ jobs:
       - name: Collect outputs
         if: always()
         run: |
-          app=$(find "$RUNNER_TEMP/derived/Build/Products" -maxdepth 2 -name '*.app' | head -1)
+          app=$(find "$RUNNER_TEMP/derived/Build/Products" -maxdepth 2 -name '*.app' 2>/dev/null | head -1 || true)
           { echo "app=$app"; [ -n "$app" ] && /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' -c 'Print :CFBundleShortVersionString' -c 'Print :CFBundleVersion' -c 'Print :MinimumOSVersion' "$app/Info.plist" && ls "$app" && file "$app/ZulipMobile"; } 2>&1 | tee "$EVIDENCE/outputs.txt"
           git status --porcelain=v1 --untracked-files=no | tee "$EVIDENCE/tracked-after-build.txt"
-          gzip -k "$EVIDENCE/xcodebuild.txt" && rm "$EVIDENCE/xcodebuild.txt" || true
+          gzip "$EVIDENCE/xcodebuild.txt" || true
       - if: always()
         uses: actions/upload-artifact@v4
         with: { name: v1-diag-baseline-ios, path: "${{ runner.temp }}/evidence", retention-days: 30 }
