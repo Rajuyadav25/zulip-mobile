@@ -1,0 +1,142 @@
+# Release Pipeline V1 — Fastlane Distribution Lanes (Gate ⑤)
+#
+# These lanes DISTRIBUTE an already-built, already-signed, already-verified
+# artifact produced and verified by Gate ③ (templates/android-build.yml) or
+# Gate ④ (templates/ios-build.yml). They never build, archive, export, sign,
+# or resign anything.
+#
+# All repository-specific identifiers and artifact paths are read from
+# environment variables set by templates/release.yml from
+# build-requirements.md. No repository-specific value is hardcoded here.
+#
+# Authentication material is reconstructed by templates/release.yml into a
+# bounded temporary path under RUNNER_TEMP before these lanes run, and
+# referenced here only by path. These lanes never print credential
+# contents.
+#
+# Android targets Google Play Internal testing only. iOS targets TestFlight
+# internal testing only (skip_submission: true, distribute_external: false).
+# Neither lane claims store/App Store production acceptance.
+
+default_platform(:android)
+
+require "digest"
+
+platform :android do
+  desc "Upload an existing, already-verified AAB to Google Play Internal testing. Does not build or sign the AAB."
+  lane :distribute_internal do
+    aab_path = ENV["ANDROID_AAB_PATH"]
+    UI.user_error!("ANDROID_AAB_PATH is not set") if aab_path.to_s.empty?
+    UI.user_error!("Expected AAB not found at #{aab_path}") unless File.file?(aab_path)
+
+    json_key_path = ENV["GOOGLE_PLAY_JSON_KEY_PATH"]
+    UI.user_error!("GOOGLE_PLAY_JSON_KEY_PATH is not set") if json_key_path.to_s.empty?
+    UI.user_error!("Google Play credential not found at #{json_key_path}") unless File.file?(json_key_path)
+
+    package_name = ENV["ANDROID_PACKAGE_NAME"]
+    UI.user_error!("ANDROID_PACKAGE_NAME is not set") if package_name.to_s.empty?
+    expected_version_code = ENV["ANDROID_VERSION_CODE"]
+    UI.user_error!("ANDROID_VERSION_CODE is not set") if expected_version_code.to_s.empty?
+
+    upload_to_play_store(
+      package_name: package_name,
+      aab: aab_path,
+      track: "internal",
+      json_key: json_key_path,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+      skip_upload_changelogs: true
+    )
+
+    evidence_path = ENV["ANDROID_DISTRIBUTION_EVIDENCE_PATH"]
+    if evidence_path.to_s != ""
+      evidence = {
+        package_name: package_name,
+        track: "internal",
+        aab_path: aab_path,
+        sha256: Digest::SHA256.file(aab_path).hexdigest
+      }
+
+      version_codes = Array(google_play_track_version_codes(
+        package_name: package_name,
+        track: "internal",
+        json_key: json_key_path
+      ))
+      UI.user_error!("Google Play did not return an internal-track version code") if version_codes.empty?
+      unless version_codes.map(&:to_s).include?(expected_version_code.to_s)
+        UI.user_error!("Google Play internal track does not contain expected version code #{expected_version_code}")
+      end
+      evidence[:version_codes] = version_codes
+      evidence[:confirmation] = "Google Play Internal track queried after upload"
+
+      require "json"
+      File.write(evidence_path, JSON.pretty_generate(evidence))
+    end
+  end
+end
+
+platform :ios do
+  desc "Upload an existing, already-verified IPA to TestFlight internal testing. Does not build, archive, export, or resign the IPA."
+  lane :distribute_internal do
+    ipa_path = ENV["IOS_IPA_PATH"]
+    UI.user_error!("IOS_IPA_PATH is not set") if ipa_path.to_s.empty?
+    UI.user_error!("Expected IPA not found at #{ipa_path}") unless File.file?(ipa_path)
+
+    key_id = ENV["APP_STORE_CONNECT_KEY_ID"]
+    issuer_id = ENV["APP_STORE_CONNECT_ISSUER_ID"]
+    key_filepath = ENV["APP_STORE_CONNECT_KEY_PATH"]
+    UI.user_error!("APP_STORE_CONNECT_KEY_ID is not set") if key_id.to_s.empty?
+    UI.user_error!("APP_STORE_CONNECT_ISSUER_ID is not set") if issuer_id.to_s.empty?
+    UI.user_error!("App Store Connect API key not found at #{key_filepath}") unless key_filepath.to_s != "" && File.file?(key_filepath)
+
+    bundle_identifier = ENV["IOS_BUNDLE_IDENTIFIER"]
+    UI.user_error!("IOS_BUNDLE_IDENTIFIER is not set") if bundle_identifier.to_s.empty?
+    expected_build_number = ENV["IOS_BUILD_NUMBER"]
+    UI.user_error!("IOS_BUILD_NUMBER is not set") if expected_build_number.to_s.empty?
+    expected_app_version = ENV["IOS_APP_VERSION"]
+    UI.user_error!("IOS_APP_VERSION is not set") if expected_app_version.to_s.empty?
+
+    api_key = app_store_connect_api_key(
+      key_id: key_id,
+      issuer_id: issuer_id,
+      key_filepath: key_filepath,
+      in_house: false
+    )
+
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: ipa_path,
+      app_identifier: bundle_identifier,
+      skip_submission: true,
+      distribute_external: false,
+      notify_external_testers: false,
+      skip_waiting_for_build_processing: false
+    )
+
+    evidence_path = ENV["IOS_DISTRIBUTION_EVIDENCE_PATH"]
+    if evidence_path.to_s != ""
+      evidence = {
+        app_identifier: bundle_identifier,
+        destination: "testflight-internal",
+        ipa_path: ipa_path,
+        sha256: Digest::SHA256.file(ipa_path).hexdigest
+      }
+
+      uploaded_build_number = latest_testflight_build_number(
+        app_identifier: bundle_identifier,
+        api_key: api_key,
+        version: expected_app_version,
+        initial_build_number: 0
+      )
+      UI.user_error!("TestFlight did not return an accepted build number") if uploaded_build_number.to_s.empty?
+      UI.user_error!("TestFlight build number #{uploaded_build_number} does not match expected #{expected_build_number}") unless uploaded_build_number.to_s == expected_build_number.to_s
+      evidence[:uploaded_build_number] = uploaded_build_number
+      evidence[:app_version] = expected_app_version
+      evidence[:confirmation] = "TestFlight processing completed after upload"
+
+      require "json"
+      File.write(evidence_path, JSON.pretty_generate(evidence))
+    end
+  end
+end

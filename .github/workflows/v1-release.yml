@@ -1,0 +1,316 @@
+# Release Pipeline V1
+# Distribution Workflow Template — Gate ⑤
+#
+# Instantiate repository-specific values from build-requirements.md before
+# installing this workflow. Every double-curly-brace token must trace to a
+# specific build-requirements.md entry.
+#
+# This workflow DISTRIBUTES an already-built, already-signed, already
+# verified artifact. It does not compile, archive, export, or sign either
+# application:
+#   - the Android AAB must already have passed Gate ③ (templates/android-build.yml)
+#   - the iOS IPA must already have passed Gate ④ (templates/ios-build.yml)
+#
+# Artifact continuity: the AAB and IPA distributed here are downloaded, by
+# artifact name, from the EXACT prior Gate ③/④ workflow run identified by
+# the run-id inputs below. Nothing is silently selected. The SHA-256
+# recorded by those earlier gates is re-verified here before upload so the
+# distributed bytes are provably the same bytes that were signed and
+# verified.
+#
+# Instantiation must provide exact repository-relative workflow paths for
+# Gate ③ and Gate ④ as ANDROID_BUILD_WORKFLOW_PATH and
+# IOS_BUILD_WORKFLOW_PATH. Manual dispatch also requires the common source
+# commit SHA; run metadata and artifact provenance are validated before any
+# store action is invoked.
+#
+# Distribution targets for V1 fixture qualification are fixed and are not
+# parameterized:
+#   - Android -> Google Play Internal testing track only
+#   - iOS     -> TestFlight internal testing only (no external testers,
+#                no App Store production submission)
+#
+# This workflow uses a macOS runner with Xcode selected to supply Apple's
+# Transporter for TestFlight upload. It performs no compilation or signing.
+#
+# This workflow uses a fixed V1 secret-name interface for distribution
+# credentials:
+#   GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_BASE64
+#   APP_STORE_CONNECT_KEY_ID
+#   APP_STORE_CONNECT_ISSUER_ID
+#   APP_STORE_CONNECT_API_KEY_P8_BASE64
+# These secret names are stable across repositories and are not
+# parameterized.
+#
+# Triggering is deliberately manual: distribution is an intentional release
+# act, not something that should fire automatically on push/PR. The two
+# run-id inputs are part of this template's fixed structure (required for
+# artifact continuity) regardless of how a repository chooses to expose the
+# trigger.
+
+name: Distribute Verified Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Platforms to distribute in this dispatch (Gate 5 still requires both, for the same source_sha)"
+        required: true
+        type: choice
+        options:
+          - both
+          - android
+          - ios
+        default: both
+      android_build_run_id:
+        description: "Workflow run ID of the Gate 3 run that produced the verified AAB (required unless platforms=ios)"
+        required: false
+        type: string
+      ios_build_run_id:
+        description: "Workflow run ID of the Gate 4 run that produced the verified IPA (required unless platforms=android)"
+        required: false
+        type: string
+      source_sha:
+        description: "Exact source commit SHA used by both verified build runs"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  distribute:
+    name: Distribute to Google Play Internal and TestFlight
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Select Xcode 26.6 (17F113)
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.0.app/Contents/Developer
+          xcodebuild -version | tee /dev/stderr | grep -q "Build version 17F113"
+
+      - name: Check Apple upload prerequisite
+        if: inputs.platforms != 'android'
+        run: xcrun --find iTMSTransporter
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4.5'
+          bundler-cache: false
+
+      - name: Install Fastlane
+        run: gem install fastlane -v 2.240.1 --no-document
+
+      - name: Validate Gate 3 and Gate 4 run provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANDROID_RUN_ID: ${{ inputs.android_build_run_id }}
+          IOS_RUN_ID: ${{ inputs.ios_build_run_id }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          case "${PLATFORMS}" in
+            both) CHECK_ANDROID=1; CHECK_IOS=1 ;;
+            android) CHECK_ANDROID=1; CHECK_IOS=0 ;;
+            ios) CHECK_ANDROID=0; CHECK_IOS=1 ;;
+            *) echo "Invalid platforms input" >&2; exit 1 ;;
+          esac
+          if [ "${CHECK_ANDROID}" = 1 ]; then
+            case "${ANDROID_RUN_ID}" in (*[!0-9]*|'') echo "Invalid Android run ID" >&2; exit 1;; esac
+          fi
+          if [ "${CHECK_IOS}" = 1 ]; then
+            case "${IOS_RUN_ID}" in (*[!0-9]*|'') echo "Invalid iOS run ID" >&2; exit 1;; esac
+          fi
+          if ! [[ "${EXPECTED_SOURCE_SHA}" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]]; then
+            echo "source_sha must be a 40- or 64-character hexadecimal commit SHA" >&2
+            exit 1
+          fi
+
+          get_run() {
+            curl --fail --silent --show-error \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/$1"
+          }
+
+          if [ "${CHECK_ANDROID}" = 1 ]; then
+            ANDROID_RUN_JSON="$(get_run "${ANDROID_RUN_ID}")"
+            test "$(jq -r '.status' <<<"${ANDROID_RUN_JSON}")" = completed
+            test "$(jq -r '.conclusion' <<<"${ANDROID_RUN_JSON}")" = success
+            test "$(jq -r '.path' <<<"${ANDROID_RUN_JSON}")" = ".github/workflows/v1-android-build.yml"
+            test "$(jq -r '.head_sha' <<<"${ANDROID_RUN_JSON}")" = "${EXPECTED_SOURCE_SHA}"
+          fi
+          if [ "${CHECK_IOS}" = 1 ]; then
+            IOS_RUN_JSON="$(get_run "${IOS_RUN_ID}")"
+            test "$(jq -r '.status' <<<"${IOS_RUN_JSON}")" = completed
+            test "$(jq -r '.conclusion' <<<"${IOS_RUN_JSON}")" = success
+            test "$(jq -r '.path' <<<"${IOS_RUN_JSON}")" = ".github/workflows/v1-ios-build.yml"
+            test "$(jq -r '.head_sha' <<<"${IOS_RUN_JSON}")" = "${EXPECTED_SOURCE_SHA}"
+          fi
+
+      - name: Download verified AAB from Gate 3
+        if: inputs.platforms != 'ios'
+        uses: actions/download-artifact@v4
+        with:
+          name: zulip-release-aab
+          run-id: ${{ inputs.android_build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/v1-dist/android
+
+      - name: Download verified IPA from Gate 4
+        if: inputs.platforms != 'android'
+        uses: actions/download-artifact@v4
+        with:
+          name: zulip-release-ipa
+          run-id: ${{ inputs.ios_build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/v1-dist/ios
+
+      - name: Confirm submitted AAB matches Gate 3 evidence
+        if: inputs.platforms != 'ios'
+        run: |
+          set -euo pipefail
+          if [ ! -f "${{ runner.temp }}/v1-dist/android/release.aab" ]; then
+            echo "Expected AAB not found at ${{ runner.temp }}/v1-dist/android/release.aab" >&2
+            exit 1
+          fi
+          if [ ! -f "${{ runner.temp }}/v1-dist/android/release.aab.sha256" ]; then
+            echo "Expected Gate 3 SHA-256 evidence not found at ${{ runner.temp }}/v1-dist/android/release.aab.sha256" >&2
+            exit 1
+          fi
+          if [ ! -f "${{ runner.temp }}/v1-dist/android/release.aab.provenance.txt" ]; then
+            echo "Expected Gate 3 provenance evidence not found" >&2
+            exit 1
+          fi
+          EXPECTED_HASH=$(awk '{print $1}' "${{ runner.temp }}/v1-dist/android/release.aab.sha256")
+          test "$(grep '^repository=' "${{ runner.temp }}/v1-dist/android/release.aab.provenance.txt" | cut -d= -f2-)" = "${GITHUB_REPOSITORY}"
+          test "$(grep '^workflow_path=' "${{ runner.temp }}/v1-dist/android/release.aab.provenance.txt" | cut -d= -f2-)" = ".github/workflows/v1-android-build.yml"
+          test "$(grep '^artifact_name=' "${{ runner.temp }}/v1-dist/android/release.aab.provenance.txt" | cut -d= -f2-)" = "zulip-release-aab"
+          test "$(grep '^run_id=' "${{ runner.temp }}/v1-dist/android/release.aab.provenance.txt" | cut -d= -f2-)" = "${{ inputs.android_build_run_id }}"
+          test "$(grep '^sha=' "${{ runner.temp }}/v1-dist/android/release.aab.provenance.txt" | cut -d= -f2-)" = "${{ inputs.source_sha }}"
+          test "$(grep '^sha256=' "${{ runner.temp }}/v1-dist/android/release.aab.provenance.txt" | cut -d= -f2-)" = "${EXPECTED_HASH}"
+          ACTUAL_HASH=$(shasum -a 256 "${{ runner.temp }}/v1-dist/android/release.aab" | awk '{print $1}')
+          if [ "${EXPECTED_HASH}" != "${ACTUAL_HASH}" ]; then
+            echo "AAB SHA-256 does not match Gate 3 evidence: expected ${EXPECTED_HASH}, got ${ACTUAL_HASH}" >&2
+            exit 1
+          fi
+          echo "${ACTUAL_HASH}  ${{ runner.temp }}/v1-dist/android/release.aab" | tee "${{ runner.temp }}/v1-dist/android/release.aab.sha256.release-confirmed"
+
+      - name: Confirm submitted IPA matches Gate 4 evidence
+        if: inputs.platforms != 'android'
+        run: |
+          set -euo pipefail
+          if [ ! -f "${{ runner.temp }}/v1-dist/ios/release.ipa" ]; then
+            echo "Expected IPA not found at ${{ runner.temp }}/v1-dist/ios/release.ipa" >&2
+            exit 1
+          fi
+          if [ ! -f "${{ runner.temp }}/v1-dist/ios/release.ipa.sha256" ]; then
+            echo "Expected Gate 4 SHA-256 evidence not found at ${{ runner.temp }}/v1-dist/ios/release.ipa.sha256" >&2
+            exit 1
+          fi
+          if [ ! -f "${{ runner.temp }}/v1-dist/ios/release.ipa.provenance.txt" ]; then
+            echo "Expected Gate 4 provenance evidence not found" >&2
+            exit 1
+          fi
+          EXPECTED_HASH=$(awk '{print $1}' "${{ runner.temp }}/v1-dist/ios/release.ipa.sha256")
+          test "$(grep '^repository=' "${{ runner.temp }}/v1-dist/ios/release.ipa.provenance.txt" | cut -d= -f2-)" = "${GITHUB_REPOSITORY}"
+          test "$(grep '^workflow_path=' "${{ runner.temp }}/v1-dist/ios/release.ipa.provenance.txt" | cut -d= -f2-)" = ".github/workflows/v1-ios-build.yml"
+          test "$(grep '^artifact_name=' "${{ runner.temp }}/v1-dist/ios/release.ipa.provenance.txt" | cut -d= -f2-)" = "zulip-release-ipa"
+          test "$(grep '^run_id=' "${{ runner.temp }}/v1-dist/ios/release.ipa.provenance.txt" | cut -d= -f2-)" = "${{ inputs.ios_build_run_id }}"
+          test "$(grep '^sha=' "${{ runner.temp }}/v1-dist/ios/release.ipa.provenance.txt" | cut -d= -f2-)" = "${{ inputs.source_sha }}"
+          test "$(grep '^sha256=' "${{ runner.temp }}/v1-dist/ios/release.ipa.provenance.txt" | cut -d= -f2-)" = "${EXPECTED_HASH}"
+          ACTUAL_HASH=$(shasum -a 256 "${{ runner.temp }}/v1-dist/ios/release.ipa" | awk '{print $1}')
+          if [ "${EXPECTED_HASH}" != "${ACTUAL_HASH}" ]; then
+            echo "IPA SHA-256 does not match Gate 4 evidence: expected ${EXPECTED_HASH}, got ${ACTUAL_HASH}" >&2
+            exit 1
+          fi
+          echo "${ACTUAL_HASH}  ${{ runner.temp }}/v1-dist/ios/release.ipa" | tee "${{ runner.temp }}/v1-dist/ios/release.ipa.sha256.release-confirmed"
+
+      - name: Reconstruct Google Play service-account credential
+        if: inputs.platforms != 'ios'
+        env:
+          GOOGLE_PLAY_JSON_KEY_BASE64: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_BASE64 }}
+        run: |
+          set -euo pipefail
+          CRED_DIR="${RUNNER_TEMP}/play-credentials"
+          mkdir -p "${CRED_DIR}"
+          chmod 700 "${CRED_DIR}"
+          printf '%s' "${GOOGLE_PLAY_JSON_KEY_BASE64}" | base64 -D > "${CRED_DIR}/service-account.json"
+          chmod 600 "${CRED_DIR}/service-account.json"
+          echo "GOOGLE_PLAY_JSON_KEY_PATH=${CRED_DIR}/service-account.json" >> "${GITHUB_ENV}"
+
+      - name: Distribute AAB to Google Play Internal
+        if: inputs.platforms != 'ios'
+        env:
+          ANDROID_AAB_PATH: ${{ runner.temp }}/v1-dist/android/release.aab
+          ANDROID_PACKAGE_NAME: com.rajuyadav25.releasepipeline.zulip
+          ANDROID_VERSION_CODE: '235'
+          ANDROID_DISTRIBUTION_EVIDENCE_PATH: ${{ runner.temp }}/android-distribution-evidence.json
+        run: fastlane android distribute_internal
+
+      - name: Reconstruct App Store Connect API key
+        if: inputs.platforms != 'android'
+        env:
+          APP_STORE_CONNECT_API_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          CRED_DIR="${RUNNER_TEMP}/asc-credentials"
+          mkdir -p "${CRED_DIR}"
+          chmod 700 "${CRED_DIR}"
+          printf '%s' "${APP_STORE_CONNECT_API_KEY_P8_BASE64}" | base64 -D > "${CRED_DIR}/AuthKey.p8"
+          chmod 600 "${CRED_DIR}/AuthKey.p8"
+          echo "APP_STORE_CONNECT_KEY_PATH=${CRED_DIR}/AuthKey.p8" >> "${GITHUB_ENV}"
+
+      - name: Distribute IPA to TestFlight
+        if: inputs.platforms != 'android'
+        env:
+          IOS_IPA_PATH: ${{ runner.temp }}/v1-dist/ios/release.ipa
+          IOS_BUNDLE_IDENTIFIER: com.rajuyadav25.releasepipeline.zulip
+          IOS_BUILD_NUMBER: '1'
+          IOS_APP_VERSION: '27.235'
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          IOS_DISTRIBUTION_EVIDENCE_PATH: ${{ runner.temp }}/ios-distribution-evidence.json
+        run: fastlane ios distribute_internal
+
+      - name: Upload submitted-artifact hash evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: zulip-release-hashes
+          path: |
+            ${{ runner.temp }}/v1-dist/android/release.aab.sha256.release-confirmed
+            ${{ runner.temp }}/v1-dist/ios/release.ipa.sha256.release-confirmed
+            ${{ runner.temp }}/v1-dist/android/release.aab.provenance.txt
+            ${{ runner.temp }}/v1-dist/ios/release.ipa.provenance.txt
+          retention-days: 30
+
+      - name: Upload platform distribution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zulip-release-platform-evidence
+          path: |
+            ${{ runner.temp }}/android-distribution-evidence.json
+            ${{ runner.temp }}/ios-distribution-evidence.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Clean up distribution credentials
+        if: always()
+        run: |
+          rm -rf "${RUNNER_TEMP}/play-credentials"
+          rm -rf "${RUNNER_TEMP}/asc-credentials"

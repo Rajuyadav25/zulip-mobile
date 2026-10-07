@@ -1,0 +1,18 @@
+# Release Pipeline V1 — Fastlane Appfile
+#
+# This file intentionally contains no repository-specific values. The
+# package/application identifiers are repository-specific facts that must
+# trace to build-requirements.md, so they are read from environment
+# variables that templates/release.yml sets from inspection-derived
+# placeholders at instantiation time, not hardcoded here.
+#
+# This file does not contain and must never be made to contain real
+# credentials.
+
+for_platform :android do
+  package_name(ENV["ANDROID_PACKAGE_NAME"])
+end
+
+for_platform :ios do
+  app_identifier(ENV["IOS_BUNDLE_IDENTIFIER"])
+end
