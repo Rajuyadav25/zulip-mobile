@@ -32,7 +32,7 @@ jobs:
       - name: Yarn classic, NDK, inotify (upstream ci.yml note)
         run: |
           npm install -g yarn@1.22.22
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;24.0.8215888" "platforms;android-34" > /dev/null
+          set +o pipefail; yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;24.0.8215888" "platforms;android-34" > /dev/null; s=${PIPESTATUS[1]}; set -o pipefail; [ "$s" = 0 ] || { echo "sdkmanager exit $s"; exit 1; }
           echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf && sudo sysctl -p
           { java -version; node -v; yarn -v; ls "$ANDROID_HOME/ndk"; } 2>&1 | tee "$EVIDENCE/toolchain.txt"
       - name: Frozen install (yarn install --frozen-lockfile; runs tools/postinstall)
