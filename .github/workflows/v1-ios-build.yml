@@ -1,0 +1,392 @@
+# Release Pipeline V1
+# iOS Signed Release Build Workflow Template
+#
+# Instantiate repository-specific values and optional blocks from
+# build-requirements.md before installing this workflow.
+#
+# Do not guess toolchain versions, package managers, Ruby/CocoaPods
+# setup, Xcode workspace/project/scheme/configuration, archive/export
+# paths, or signing requirements. Every double-curly-brace token and
+# replaceable block must trace to a specific build-requirements.md
+# entry.
+#
+# This workflow produces a signed, exportable IPA only. It does not
+# submit to TestFlight or the App Store. Distribution acceptance is a
+# separate, later gate and must not be inferred from a successful run
+# of this workflow. It also does not establish repository baseline
+# buildability (a separate, earlier gate) or compatibility with every
+# Xcode version.
+#
+# This template requires a macOS GitHub-hosted runner because
+# xcodebuild/codesign require macOS. The exact runner image (and, if
+# needed, the Xcode version selected on that image) must be chosen
+# from the repository's inspected Xcode/toolchain requirement rather
+# than assumed to be the newest available image.
+#
+# This workflow uses a fixed V1 secret-name interface for Apple
+# signing material:
+#   IOS_CERTIFICATE_P12_BASE64
+#   IOS_CERTIFICATE_PASSWORD
+#   IOS_PROVISIONING_PROFILE_BASE64
+#   IOS_KEYCHAIN_PASSWORD
+# These secret names are stable across repositories and are not
+# parameterized. Only non-secret, repository-specific identifiers and
+# configuration remain parameterized.
+
+name: iOS Signed Release Build
+
+on:
+  push:
+    branches: [v1-qualification]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Signed IPA
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26.6 (17F113)
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.0.app/Contents/Developer
+          xcodebuild -version | tee /dev/stderr | grep -q "Build version 17F113"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16.20.2'
+
+      - name: Set up Yarn classic
+        run: npm install --global yarn@1.22.22
+
+      # The repository's postinstall (tools/postinstall) runs `pod install` on macOS and exits
+      # if CocoaPods is missing, so Ruby and CocoaPods are set up before installing dependencies
+      # (build-requirements.md §3, §7).
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4.5'
+          bundler-cache: false
+
+      - name: Install CocoaPods 1.16.2 (Podfile.lock COCOAPODS)
+        run: gem install --no-document cocoapods -v 1.16.2
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --non-interactive
+
+      # `pod install` ran in the repository's postinstall above (build-requirements.md §3).
+      - name: Lock portability guard
+        run: .github/v1/lock-portability-guard.sh .github/v1/ios-podfile-lock.conf "${RUNNER_TEMP}/lock-guard"
+
+      # tools/build-webview (an Xcode build phase) requires GNU coreutils (build-requirements.md §7).
+      - name: Install GNU coreutils
+        run: brew install coreutils
+
+      - name: Reconstruct Apple signing material
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          SIGNING_DIR="${RUNNER_TEMP}/ios-signing"
+          mkdir -p "${SIGNING_DIR}"
+          chmod 700 "${SIGNING_DIR}"
+          KEYCHAIN_PATH="${SIGNING_DIR}/release.keychain-db"
+          CERT_PATH="${SIGNING_DIR}/certificate.p12"
+          PROFILE_PATH="${SIGNING_DIR}/profile.mobileprovision"
+          ORIGINAL_KEYCHAINS_FILE="${SIGNING_DIR}/original-keychains.txt"
+          INSTALLED_PROFILE_FILE="${SIGNING_DIR}/installed-profile-path.txt"
+
+          printf '%s' "${CERTIFICATE_BASE64}" | base64 -D > "${CERT_PATH}"
+          printf '%s' "${PROFILE_BASE64}" | base64 -D > "${PROFILE_PATH}"
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          # Persist the original user-domain keychain search list, one path
+          # per line, so cleanup can restore it later without eval or
+          # unsafe word splitting.
+          security list-keychains -d user | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//' > "${ORIGINAL_KEYCHAINS_FILE}"
+
+          EXISTING_KEYCHAINS=()
+          while IFS= read -r keychain_line; do
+            [ -n "${keychain_line}" ] && EXISTING_KEYCHAINS+=("${keychain_line}")
+          done < "${ORIGINAL_KEYCHAINS_FILE}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}" "${EXISTING_KEYCHAINS[@]}"
+
+          security import "${CERT_PATH}" -k "${KEYCHAIN_PATH}" -P "${CERTIFICATE_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          IDENTITY_COUNT=$(security find-identity -v -p codesigning "${KEYCHAIN_PATH}" | awk '/valid identities found/ {print $1}')
+          if [ "${IDENTITY_COUNT:-0}" -lt 1 ]; then
+            echo "No usable code-signing identity was installed in ${KEYCHAIN_PATH}" >&2
+            exit 1
+          fi
+
+          PROFILE_UUID=$(security cms -D -i "${PROFILE_PATH}" | plutil -extract UUID xml1 -o - - | sed -n 's/.*<string>\(.*\)<\/string>.*/\1/p')
+          if [ -z "${PROFILE_UUID}" ]; then
+            echo "Unable to determine provisioning profile UUID" >&2
+            exit 1
+          fi
+
+          PROFILES_DIR="${HOME}/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "${PROFILES_DIR}"
+          INSTALLED_PROFILE_PATH="${PROFILES_DIR}/${PROFILE_UUID}.mobileprovision"
+
+          # Never overwrite, delete, back up, or replace a provisioning
+          # profile that already exists at the destination. Only a
+          # destination this workflow itself creates may later be removed
+          # by cleanup.
+          if [ -e "${INSTALLED_PROFILE_PATH}" ]; then
+            echo "Refusing to overwrite pre-existing provisioning profile at ${INSTALLED_PROFILE_PATH}" >&2
+            exit 1
+          fi
+
+          # Persist the installed profile path before copying it into place
+          # so cleanup can locate and remove it even if a later step in
+          # this job fails.
+          printf '%s' "${INSTALLED_PROFILE_PATH}" > "${INSTALLED_PROFILE_FILE}"
+          cp "${PROFILE_PATH}" "${INSTALLED_PROFILE_PATH}"
+          chmod 600 "${CERT_PATH}" "${PROFILE_PATH}" "${INSTALLED_PROFILE_FILE}" "${INSTALLED_PROFILE_PATH}"
+
+      - name: Verify iOS signing handoff
+        env:
+          KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="${RUNNER_TEMP}/ios-signing/release.keychain-db"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          KEYCHAIN_LIST=$(security list-keychains -d user)
+          grep -Fq "${KEYCHAIN_PATH}" <<< "${KEYCHAIN_LIST}"
+          IDENTITY_REPORT=$(security find-identity -v -p codesigning "${KEYCHAIN_PATH}")
+          grep -q "valid identities found" <<< "${IDENTITY_REPORT}"
+
+      - name: Build archive
+        working-directory: .
+        env:
+          V1_IOS_KEYCHAIN_PATH: ${{ runner.temp }}/ios-signing/release.keychain-db
+        run: RCT_NO_LAUNCH_PACKAGER=1 xcodebuild -workspace ios/ZulipMobile.xcworkspace -scheme ZulipMobile -configuration Release -destination 'generic/platform=iOS' -archivePath "${RUNNER_TEMP}/ZulipMobile.xcarchive" OTHER_CODE_SIGN_FLAGS="--keychain ${V1_IOS_KEYCHAIN_PATH}" archive
+
+      - name: Confirm archive exists
+        run: |
+          set -euo pipefail
+          if [ ! -d "${RUNNER_TEMP}/ZulipMobile.xcarchive" ]; then
+            echo "Expected archive not found at ${RUNNER_TEMP}/ZulipMobile.xcarchive" >&2
+            exit 1
+          fi
+
+      - name: Export IPA
+        working-directory: .
+        env:
+          V1_IOS_KEYCHAIN_PATH: ${{ runner.temp }}/ios-signing/release.keychain-db
+        run: xcodebuild -exportArchive -archivePath "${RUNNER_TEMP}/ZulipMobile.xcarchive" -exportPath "${RUNNER_TEMP}/export" -exportOptionsPlist .github/v1/ios-export-options.plist
+
+      - name: Confirm IPA exists
+        run: |
+          set -euo pipefail
+          if [ ! -f "${RUNNER_TEMP}/export/ZulipMobile.ipa" ]; then
+            echo "Expected IPA not found at ${RUNNER_TEMP}/export/ZulipMobile.ipa" >&2
+            exit 1
+          fi
+
+      - name: Verify IPA signature and collect evidence
+        run: |
+          set -euo pipefail
+          VERIFY_DIR="${RUNNER_TEMP}/ios-verify"
+          rm -rf "${VERIFY_DIR}"
+          mkdir -p "${VERIFY_DIR}"
+          unzip -q "${RUNNER_TEMP}/export/ZulipMobile.ipa" -d "${VERIFY_DIR}"
+
+          PAYLOAD_DIR="${VERIFY_DIR}/Payload"
+          APP_COUNT=$(find "${PAYLOAD_DIR}" -maxdepth 1 -name "*.app" | wc -l | tr -d ' ')
+          if [ "${APP_COUNT}" -ne 1 ]; then
+            echo "Expected exactly one .app bundle in IPA payload, found ${APP_COUNT}" >&2
+            exit 1
+          fi
+
+          APP_PATH="${PAYLOAD_DIR}/ZulipMobile.app"
+          if [ ! -d "${APP_PATH}" ]; then
+            echo "Expected application bundle not found at ${APP_PATH}" >&2
+            exit 1
+          fi
+
+          ACTUAL_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "${APP_PATH}/Info.plist")
+          if [ "${ACTUAL_BUNDLE_ID}" != "com.rajuyadav25.releasepipeline.zulip" ]; then
+            echo "Bundle identifier mismatch: expected com.rajuyadav25.releasepipeline.zulip, got ${ACTUAL_BUNDLE_ID}" >&2
+            exit 1
+          fi
+
+          CODESIGN_EVIDENCE="${RUNNER_TEMP}/export/ZulipMobile.ipa.codesign-verify.txt"
+          codesign --verify --deep --strict --verbose=4 "${APP_PATH}" > "${CODESIGN_EVIDENCE}" 2>&1
+          codesign -dvv "${APP_PATH}" >> "${CODESIGN_EVIDENCE}" 2>&1
+
+          ACTUAL_TEAM_ID=$(grep '^TeamIdentifier=' "${CODESIGN_EVIDENCE}" | head -n1 | sed 's/^TeamIdentifier=//')
+          if [ -z "${ACTUAL_TEAM_ID}" ] || [ "${ACTUAL_TEAM_ID}" = "not set" ]; then
+            echo "codesign did not report a TeamIdentifier for ${APP_PATH}" >&2
+            exit 1
+          fi
+          if [ "${ACTUAL_TEAM_ID}" != "S7LTR2XADQ" ]; then
+            echo "TeamIdentifier mismatch: expected S7LTR2XADQ, got ${ACTUAL_TEAM_ID}" >&2
+            exit 1
+          fi
+
+          codesign -d --entitlements :- --xml "${APP_PATH}" > "${RUNNER_TEMP}/export/ZulipMobile.ipa.entitlements.plist"
+
+          if [ ! -f "${APP_PATH}/embedded.mobileprovision" ]; then
+            echo "Expected embedded.mobileprovision not found in application bundle" >&2
+            exit 1
+          fi
+          PROFILE_EVIDENCE="${RUNNER_TEMP}/export/ZulipMobile.ipa.embedded-provisioning.plist"
+          security cms -D -i "${APP_PATH}/embedded.mobileprovision" > "${PROFILE_EVIDENCE}"
+
+          PROFILE_TEAM_ID=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" "${PROFILE_EVIDENCE}" 2>/dev/null || /usr/libexec/PlistBuddy -c "Print :TeamIdentifier" "${PROFILE_EVIDENCE}" 2>/dev/null || true)
+          if [ "${PROFILE_TEAM_ID}" != "S7LTR2XADQ" ]; then
+            echo "Embedded provisioning profile TeamIdentifier does not contain expected team S7LTR2XADQ" >&2
+            exit 1
+          fi
+
+          PROFILE_APP_ID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" "${PROFILE_EVIDENCE}" 2>/dev/null || true)
+          if [ -z "${PROFILE_APP_ID}" ]; then
+            echo "Embedded provisioning profile is missing the application-identifier entitlement" >&2
+            exit 1
+          fi
+          # application-identifier takes the form TEAMID.bundle.identifier,
+          # where the bundle-identifier portion may end in a wildcard
+          # segment (e.g. com.example.*) under normal profile semantics.
+          PROFILE_APP_ID_SUFFIX="${PROFILE_APP_ID#*.}"
+          case "com.rajuyadav25.releasepipeline.zulip" in
+            ${PROFILE_APP_ID_SUFFIX})
+              ;;
+            *)
+              echo "Embedded provisioning profile application-identifier (${PROFILE_APP_ID}) is not compatible with expected bundle identifier com.rajuyadav25.releasepipeline.zulip" >&2
+              exit 1
+              ;;
+          esac
+
+          # TeamIdentifier alone also matches the team's development
+          # certificates, so bind the signature to the expected owner
+          # distribution certificate (non-secret SHA-256 fingerprint) and to
+          # an App Store-type profile that authorizes that certificate.
+          CERT_DIR="${VERIFY_DIR}/signing-certificates"
+          mkdir -p "${CERT_DIR}"
+          (cd "${CERT_DIR}" && codesign -d --extract-certificates "${APP_PATH}" > /dev/null 2>&1)
+          if [ ! -f "${CERT_DIR}/codesign0" ]; then
+            echo "Unable to extract the signing certificate from ${APP_PATH}" >&2
+            exit 1
+          fi
+          SIGNING_CERT_SHA256=$(shasum -a 256 "${CERT_DIR}/codesign0" | awk '{print toupper($1)}')
+          EXPECTED_CERT_SHA256=$(printf '%s' "A7:D7:F3:65:BD:30:DF:CE:8F:60:F7:EA:F0:C5:5D:F4:F7:7C:A7:C3:BF:98:2E:C4:28:E9:E8:34:6C:80:6B:23" | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')
+          if [ "${SIGNING_CERT_SHA256}" != "${EXPECTED_CERT_SHA256}" ]; then
+            echo "Signing certificate SHA-256 mismatch: expected ${EXPECTED_CERT_SHA256}, got ${SIGNING_CERT_SHA256}" >&2
+            exit 1
+          fi
+          echo "signing_cert_sha256=${SIGNING_CERT_SHA256}" >> "${CODESIGN_EVIDENCE}"
+
+          PROFILE_CERT_MATCH=$(python3 -c 'import hashlib,plistlib,sys; p=plistlib.load(open(sys.argv[1],"rb")); print("yes" if sys.argv[2] in [hashlib.sha256(c).hexdigest().upper() for c in p.get("DeveloperCertificates",[])] else "no")' "${PROFILE_EVIDENCE}" "${SIGNING_CERT_SHA256}")
+          if [ "${PROFILE_CERT_MATCH}" != "yes" ]; then
+            echo "Embedded provisioning profile does not authorize the signing certificate" >&2
+            exit 1
+          fi
+          if /usr/libexec/PlistBuddy -c "Print :ProvisionedDevices" "${PROFILE_EVIDENCE}" > /dev/null 2>&1 || /usr/libexec/PlistBuddy -c "Print :ProvisionsAllDevices" "${PROFILE_EVIDENCE}" > /dev/null 2>&1; then
+            echo "Embedded provisioning profile is not an App Store distribution profile (it provisions devices)" >&2
+            exit 1
+          fi
+          if [ "$(/usr/libexec/PlistBuddy -c "Print :Entitlements:get-task-allow" "${PROFILE_EVIDENCE}" 2>/dev/null)" = "true" ]; then
+            echo "Embedded provisioning profile allows get-task-allow (development profile)" >&2
+            exit 1
+          fi
+          if [ "$(/usr/libexec/PlistBuddy -c "Print :get-task-allow" "${RUNNER_TEMP}/export/ZulipMobile.ipa.entitlements.plist" 2>/dev/null)" = "true" ]; then
+            echo "Signed entitlements contain get-task-allow=true" >&2
+            exit 1
+          fi
+
+      - name: Compute SHA-256
+        run: |
+          set -euo pipefail
+          shasum -a 256 "${RUNNER_TEMP}/export/ZulipMobile.ipa" | tee "${RUNNER_TEMP}/export/ZulipMobile.ipa.sha256"
+          ARTIFACT_DIR="${RUNNER_TEMP}/v1-ios-artifact"
+          rm -rf "${ARTIFACT_DIR}"
+          mkdir -p "${ARTIFACT_DIR}"
+          chmod 700 "${ARTIFACT_DIR}"
+          cp "${RUNNER_TEMP}/export/ZulipMobile.ipa" "${ARTIFACT_DIR}/release.ipa"
+          cp "${RUNNER_TEMP}/export/ZulipMobile.ipa.sha256" "${ARTIFACT_DIR}/release.ipa.sha256"
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            WORKFLOW_PATH="${GITHUB_WORKFLOW_REF#${GITHUB_REPOSITORY}/}"
+            WORKFLOW_PATH="${WORKFLOW_PATH%@*}"
+            echo "workflow_path=${WORKFLOW_PATH}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "sha=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF}"
+            echo "artifact_name=zulip-release-ipa"
+            echo "artifact_path=${RUNNER_TEMP}/export/ZulipMobile.ipa"
+            ARTIFACT_HASH=$(awk '{print $1}' "${RUNNER_TEMP}/export/ZulipMobile.ipa.sha256")
+            echo "sha256=${ARTIFACT_HASH}"
+            echo "signing_cert_sha256=$(printf '%s' "A7:D7:F3:65:BD:30:DF:CE:8F:60:F7:EA:F0:C5:5D:F4:F7:7C:A7:C3:BF:98:2E:C4:28:E9:E8:34:6C:80:6B:23" | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          } > "${ARTIFACT_DIR}/release.ipa.provenance.txt"
+          cp "${RUNNER_TEMP}/export/ZulipMobile.ipa.codesign-verify.txt" "${ARTIFACT_DIR}/release.ipa.codesign-verify.txt"
+          cp "${RUNNER_TEMP}/export/ZulipMobile.ipa.entitlements.plist" "${ARTIFACT_DIR}/release.ipa.entitlements.plist"
+          cp "${RUNNER_TEMP}/export/ZulipMobile.ipa.embedded-provisioning.plist" "${ARTIFACT_DIR}/release.ipa.embedded-provisioning.plist"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zulip-release-ipa
+          path: ${{ runner.temp }}/v1-ios-artifact
+          retention-days: 30
+
+      - name: Clean up signing material
+        if: always()
+        run: |
+          SIGNING_DIR="${RUNNER_TEMP}/ios-signing"
+          KEYCHAIN_PATH="${SIGNING_DIR}/release.keychain-db"
+          ORIGINAL_KEYCHAINS_FILE="${SIGNING_DIR}/original-keychains.txt"
+          INSTALLED_PROFILE_FILE="${SIGNING_DIR}/installed-profile-path.txt"
+
+          # Paths are derived deterministically (not from signing-step
+          # outputs) so cleanup still works if signing setup failed partway
+          # through and never completed.
+
+          if [ -f "${ORIGINAL_KEYCHAINS_FILE}" ]; then
+            ORIGINAL_KEYCHAINS=()
+            while IFS= read -r keychain_line; do
+              [ -n "${keychain_line}" ] && ORIGINAL_KEYCHAINS+=("${keychain_line}")
+            done < "${ORIGINAL_KEYCHAINS_FILE}"
+            if [ "${#ORIGINAL_KEYCHAINS[@]}" -gt 0 ]; then
+              security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" || true
+            else
+              # The original user-domain search list was empty; restore
+              # that exact state rather than leaving the temporary
+              # keychain in the list.
+              security list-keychains -d user -s || true
+            fi
+          fi
+
+          if [ -f "${KEYCHAIN_PATH}" ]; then
+            security delete-keychain "${KEYCHAIN_PATH}" || true
+          fi
+
+          if [ -f "${INSTALLED_PROFILE_FILE}" ]; then
+            INSTALLED_PROFILE_PATH="$(cat "${INSTALLED_PROFILE_FILE}")"
+            if [ -n "${INSTALLED_PROFILE_PATH}" ]; then
+              rm -f "${INSTALLED_PROFILE_PATH}"
+            fi
+          fi
+
+          rm -rf "${RUNNER_TEMP}/ios-signing"
+          rm -rf "${RUNNER_TEMP}/ios-verify"
