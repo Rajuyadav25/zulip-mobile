@@ -83,6 +83,20 @@ target 'ZulipMobile' do
         config.build_settings['OTHER_CFLAGS'] = '$(inherited) -Wno-error=deprecated-literal-operator'
       end
     end
+
+    # Sentry 8.36.0 declares std::vector<const ThreadHandleMetadataPair>, which
+    # the libc++ in Xcode 16.3+ rejects (std::allocator of a const type). Apply
+    # sentry-cocoa's own fix (getsentry/sentry-cocoa@7c55297340, #4918, released
+    # in 8.46.0) to the downloaded pod source. Fail if the source is not as expected.
+    sentry_header = File.join(installer.sandbox.root, 'Sentry/Sources/Sentry/include/SentryThreadMetadataCache.hpp')
+    sentry_old = 'std::vector<const ThreadHandleMetadataPair> threadMetadataCache_;'
+    sentry_new = 'std::vector<ThreadHandleMetadataPair> threadMetadataCache_;'
+    sentry_src = File.read(sentry_header)
+    unless sentry_src.scan(sentry_new).length == 1 && !sentry_src.include?(sentry_old)
+      raise "Unexpected #{sentry_header}" unless sentry_src.scan(sentry_old).length == 1
+      File.chmod(0644, sentry_header)
+      File.write(sentry_header, sentry_src.sub(sentry_old, sentry_new))
+    end
   end
 
   use_expo_modules!
