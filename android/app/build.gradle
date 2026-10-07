@@ -168,6 +168,15 @@ android {
                 storePassword keystoreProperties.storePassword
                 keyAlias keystoreProperties.keyAlias
                 keyPassword keystoreProperties.keyPassword
+            } else if (System.getenv("V1_ANDROID_KEYSTORE_PATH")) {
+                // Release Pipeline V1: owner signing material is supplied only
+                // through environment variables by the V1 Android build workflow
+                // (secrets are never committed). Without them, and without
+                // -Psigned, release builds keep upstream debug signing.
+                storeFile file(System.getenv("V1_ANDROID_KEYSTORE_PATH"))
+                storePassword System.getenv("V1_ANDROID_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("V1_ANDROID_KEY_ALIAS")
+                keyPassword System.getenv("V1_ANDROID_KEY_PASSWORD")
             }
         }
     }
@@ -189,7 +198,7 @@ android {
             shrinkResources(enableProguardInReleaseBuilds && shrinkResourcesInProguardBuilds)
 
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
-            if (project.hasProperty('signed')) {
+            if (project.hasProperty('signed') || System.getenv("V1_ANDROID_KEYSTORE_PATH")) {
                 signingConfig signingConfigs.release
             } else {
                 signingConfig signingConfigs.debug
