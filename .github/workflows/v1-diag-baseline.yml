@@ -1,0 +1,102 @@
+# Release Pipeline V1 — DIAGNOSTIC workflow (not the V1 pipeline; no signing,
+# no secrets). Purpose: Gate ①A baseline of the UNTOUCHED pinned upstream
+# source zulip/zulip-mobile@d7cf6da7 plus the v1-qualification remediation
+# commits. This file is the only diagnostic addition.
+name: v1-diag-baseline
+on:
+  push:
+    branches: ["v1-diag/baseline-remediated"]
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  android-baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Record context
+        run: |
+          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"; mkdir -p "$RUNNER_TEMP/evidence"
+          { echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"; echo "head=$(git rev-parse HEAD) tree=$(git rev-parse 'HEAD^{tree}')"
+            echo "upstream-diff (must list only this workflow):"; git diff --stat d7cf6da79b4b9467e240b42f24330e97390a8aff HEAD; git diff --quiet d7cf6da79b4b9467e240b42f24330e97390a8aff HEAD -- . ":(exclude).github/workflows/v1-diag-baseline.yml" && echo "source identical to upstream d7cf6da7 (excluding this workflow)"; df -h /; } | tee "$RUNNER_TEMP/evidence/context.txt"
+      - name: Free runner disk (CI host only)
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL; df -h / | tee -a "$EVIDENCE/context.txt"
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '16.20.2' }
+      - name: Yarn classic, NDK, inotify (upstream ci.yml note)
+        run: |
+          npm install -g yarn@1.22.22
+          set +o pipefail; yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;24.0.8215888" "platforms;android-34" > /dev/null; s=${PIPESTATUS[1]}; set -o pipefail; [ "$s" = 0 ] || { echo "sdkmanager exit $s"; exit 1; }
+          echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf && sudo sysctl -p
+          { java -version; node -v; yarn -v; ls "$ANDROID_HOME/ndk"; } 2>&1 | tee "$EVIDENCE/toolchain.txt"
+      - name: Frozen install (yarn install --frozen-lockfile; runs tools/postinstall)
+        run: yarn install --frozen-lockfile 2>&1 | tee "$EVIDENCE/yarn-install.txt"
+      - name: Tracked tree after install
+        if: always()
+        run: git status --porcelain=v1 --untracked-files=no | tee "$EVIDENCE/tracked-after-install.txt"
+      - name: Release build (documented build:android-nokeys = tools/gradle :app:assembleRelease; plus :app:bundleRelease)
+        run: |
+          set +e
+          tools/gradle :app:assembleRelease :app:bundleRelease --no-daemon --stacktrace > "$EVIDENCE/gradle.txt" 2>&1
+          status=$?; echo "exit=$status" | tee "$EVIDENCE/gradle-status.txt"; tail -40 "$EVIDENCE/gradle.txt"; exit $status
+      - name: Collect outputs
+        if: always()
+        run: |
+          find android/app/build/outputs -type f \( -name '*.aab' -o -name '*.apk' \) -exec ls -l {} \; -exec sha256sum {} \; 2>&1 | tee "$EVIDENCE/outputs.txt"
+          git status --porcelain=v1 --untracked-files=no | tee "$EVIDENCE/tracked-after-build.txt"; df -h / >> "$EVIDENCE/context.txt"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: v1-diag-baseline-android, path: "${{ runner.temp }}/evidence", retention-days: 30 }
+
+  ios-baseline:
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Select Xcode 26.6 and record context
+        run: |
+          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"; mkdir -p "$RUNNER_TEMP/evidence"
+          sudo xcode-select -s /Applications/Xcode_26.6.0.app/Contents/Developer
+          { echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"; echo "head=$(git rev-parse HEAD) tree=$(git rev-parse 'HEAD^{tree}')"
+            echo "upstream-diff (must list only this workflow):"; git diff --stat d7cf6da79b4b9467e240b42f24330e97390a8aff HEAD; git diff --quiet d7cf6da79b4b9467e240b42f24330e97390a8aff HEAD -- . ":(exclude).github/workflows/v1-diag-baseline.yml" && echo "source identical to upstream d7cf6da7 (excluding this workflow)"; xcodebuild -version; xcrun swift --version; } 2>&1 | tee "$RUNNER_TEMP/evidence/context.txt"
+      - uses: actions/setup-node@v4
+        with: { node-version: '16.20.2' }
+      - uses: ruby/setup-ruby@v1
+        with: { ruby-version: '3.4.5', bundler-cache: false }
+      - name: Yarn classic and CocoaPods 1.16.2 (Podfile.lock COCOAPODS)
+        run: |
+          npm install -g yarn@1.22.22
+          gem install cocoapods -v 1.16.2 --no-document
+          { node -v; yarn -v; ruby -v; pod --version; } 2>&1 | tee "$EVIDENCE/toolchain.txt"
+      - name: Frozen install (yarn install --frozen-lockfile; postinstall runs pod install)
+        run: yarn install --frozen-lockfile 2>&1 | tee "$EVIDENCE/yarn-install.txt"
+      - name: Tracked tree after install
+        if: always()
+        run: |
+          git status --porcelain=v1 --untracked-files=no | tee "$EVIDENCE/tracked-after-install.txt"
+          git diff > "$EVIDENCE/tracked-after-install.diff"
+      - name: Unsigned iOS Release build (device SDK, signing disabled)
+        env: { RCT_NO_LAUNCH_PACKAGER: "1" }
+        run: |
+          set +e
+          xcodebuild -workspace ios/ZulipMobile.xcworkspace -scheme ZulipMobile -configuration Release -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO -derivedDataPath "$RUNNER_TEMP/derived" build > "$EVIDENCE/xcodebuild.txt" 2>&1
+          status=$?; echo "exit=$status" | tee "$EVIDENCE/xcodebuild-status.txt"
+          grep -nE 'error:|\*\* BUILD' "$EVIDENCE/xcodebuild.txt" | head -60; exit $status
+      - name: Collect outputs
+        if: always()
+        run: |
+          app=$(find "$RUNNER_TEMP/derived/Build/Products" -maxdepth 2 -name '*.app' | head -1)
+          { echo "app=$app"; [ -n "$app" ] && /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' -c 'Print :CFBundleShortVersionString' -c 'Print :CFBundleVersion' -c 'Print :MinimumOSVersion' "$app/Info.plist" && ls "$app" && file "$app/ZulipMobile"; } 2>&1 | tee "$EVIDENCE/outputs.txt"
+          git status --porcelain=v1 --untracked-files=no | tee "$EVIDENCE/tracked-after-build.txt"
+          gzip -k "$EVIDENCE/xcodebuild.txt" && rm "$EVIDENCE/xcodebuild.txt" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: v1-diag-baseline-ios, path: "${{ runner.temp }}/evidence", retention-days: 30 }
