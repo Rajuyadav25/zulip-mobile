@@ -17,11 +17,12 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 3 }
       - name: Record context
         run: |
           echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"; mkdir -p "$RUNNER_TEMP/evidence"
           { echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"; echo "head=$(git rev-parse HEAD) tree=$(git rev-parse 'HEAD^{tree}')"
-            echo "upstream-diff (must list only this workflow):"; git diff --stat d7cf6da79b4b9467e240b42f24330e97390a8aff HEAD; df -h /; } | tee "$RUNNER_TEMP/evidence/context.txt"
+            echo "upstream-diff (must list only this workflow):"; git diff --stat d7cf6da79b4b9467e240b42f24330e97390a8aff HEAD; git diff --quiet d7cf6da79b4b9467e240b42f24330e97390a8aff HEAD -- . ":(exclude).github/workflows/v1-diag-baseline.yml" && echo "source identical to upstream d7cf6da7 (excluding this workflow)"; df -h /; } | tee "$RUNNER_TEMP/evidence/context.txt"
       - name: Free runner disk (CI host only)
         run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL; df -h / | tee -a "$EVIDENCE/context.txt"
       - uses: actions/setup-java@v4
@@ -58,12 +59,13 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 3 }
       - name: Select Xcode 26.6 and record context
         run: |
           echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"; mkdir -p "$RUNNER_TEMP/evidence"
           sudo xcode-select -s /Applications/Xcode_26.6.0.app/Contents/Developer
           { echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"; echo "head=$(git rev-parse HEAD) tree=$(git rev-parse 'HEAD^{tree}')"
-            echo "upstream-diff (must list only this workflow):"; git diff --stat d7cf6da79b4b9467e240b42f24330e97390a8aff HEAD; xcodebuild -version; xcrun swift --version; } 2>&1 | tee "$RUNNER_TEMP/evidence/context.txt"
+            echo "upstream-diff (must list only this workflow):"; git diff --stat d7cf6da79b4b9467e240b42f24330e97390a8aff HEAD; git diff --quiet d7cf6da79b4b9467e240b42f24330e97390a8aff HEAD -- . ":(exclude).github/workflows/v1-diag-baseline.yml" && echo "source identical to upstream d7cf6da7 (excluding this workflow)"; xcodebuild -version; xcrun swift --version; } 2>&1 | tee "$RUNNER_TEMP/evidence/context.txt"
       - uses: actions/setup-node@v4
         with: { node-version: '16.20.2' }
       - uses: ruby/setup-ruby@v1
