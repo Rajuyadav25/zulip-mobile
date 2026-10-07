@@ -75,7 +75,8 @@ jobs:
         run: |
           npm install -g yarn@1.22.22
           gem install cocoapods -v 1.16.2 --no-document
-          { node -v; yarn -v; ruby -v; pod --version; } 2>&1 | tee "$EVIDENCE/toolchain.txt"
+          brew install coreutils
+          { node -v; yarn -v; ruby -v; pod --version; "$(brew --prefix)/opt/coreutils/libexec/gnubin/readlink" --version | head -1; } 2>&1 | tee "$EVIDENCE/toolchain.txt"
       - name: Frozen install (yarn install --frozen-lockfile; postinstall runs pod install)
         run: yarn install --frozen-lockfile 2>&1 | tee "$EVIDENCE/yarn-install.txt"
       - name: Tracked tree after install
@@ -100,3 +101,41 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with: { name: v1-diag-baseline-ios, path: "${{ runner.temp }}/evidence", retention-days: 30 }
+
+  ios-lock-portability:
+    # Section 13A: the same commit installed from two checkouts at different
+    # absolute paths on one runner; Podfile.lock from each is compared with
+    # each other and with the committed lock.
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Select Xcode 26.6
+        run: |
+          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"; mkdir -p "$RUNNER_TEMP/evidence"
+          sudo xcode-select -s /Applications/Xcode_26.6.0.app/Contents/Developer
+      - uses: actions/setup-node@v4
+        with: { node-version: '16.20.2' }
+      - uses: ruby/setup-ruby@v1
+        with: { ruby-version: '3.4.5', bundler-cache: false }
+      - name: Tools
+        run: npm install -g yarn@1.22.22 && gem install cocoapods -v 1.16.2 --no-document
+      - name: Install from two checkout paths
+        run: |
+          A="$GITHUB_WORKSPACE"; B="$RUNNER_TEMP/second-checkout/elsewhere/zulip-mobile"
+          git clone -q "$A" "$B"; git -C "$B" checkout -q "$(git -C "$A" rev-parse HEAD)"
+          cp ios/Podfile.lock "$EVIDENCE/Podfile.lock.committed"
+          for P in "$A" "$B"; do
+            tag=$([ "$P" = "$A" ] && echo A || echo B)
+            echo "$tag=$P" | tee -a "$EVIDENCE/paths.txt"
+            ( cd "$P" && yarn install --frozen-lockfile > "$EVIDENCE/install-$tag.txt" 2>&1 )
+            cp "$P/ios/Podfile.lock" "$EVIDENCE/Podfile.lock.$tag"
+            git -C "$P" status --porcelain=v1 --untracked-files=no > "$EVIDENCE/tracked-$tag.txt"
+            mkdir -p "$EVIDENCE/local-podspecs-$tag"; cp "$P"/ios/Pods/Local\ Podspecs/*.json "$EVIDENCE/local-podspecs-$tag/"
+          done
+          { echo "== A vs B"; diff "$EVIDENCE/Podfile.lock.A" "$EVIDENCE/Podfile.lock.B" && echo IDENTICAL
+            echo "== committed vs A"; diff "$EVIDENCE/Podfile.lock.committed" "$EVIDENCE/Podfile.lock.A" && echo IDENTICAL; } | tee "$EVIDENCE/comparison.txt" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: v1-diag-lock-portability, path: "${{ runner.temp }}/evidence", retention-days: 30 }
