@@ -280,7 +280,7 @@ jobs:
         env:
           IOS_IPA_PATH: ${{ runner.temp }}/v1-dist/ios/release.ipa
           IOS_BUNDLE_IDENTIFIER: com.rajuyadav25.releasepipeline.zulip
-          IOS_BUILD_NUMBER: '1'
+          IOS_BUILD_NUMBER: '2'
           IOS_APP_VERSION: '27.235'
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
